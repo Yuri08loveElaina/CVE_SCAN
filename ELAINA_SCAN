@@ -1,4 +1,4 @@
-import os, sys, threading, requests, json, gzip, subprocess, smtplib, time
+import os, sys, threading, requests, json, gzip, subprocess, smtplib, time, tempfile, shutil
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
@@ -337,7 +337,6 @@ def scan_cve_list(cve_list):
     for t in threads:
         t.join()
 
-# ------------- Flask Web UI -------------
 app = Flask(__name__)
 
 log_data = []
@@ -366,21 +365,109 @@ def start_banner_thread():
     t = threading.Thread(target=print_color_banner, daemon=True)
     t.start()
 
+# -------- Exploit fetching & running --------
+
+def fetch_exploitdb_exploit(cve):
+    """
+    Tìm và tải exploit code từ Exploit-DB theo CVE.
+    Do Exploit-DB không có API chính thức, nên phần này dùng API giả lập,
+    bạn có thể thay bằng scraping hoặc API thật nếu có.
+    """
+    # Demo API giả lập:
+    api_url = f"https://www.exploit-db.com/api/search?cve={cve}"
+    try:
+        resp = requests.get(api_url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and "exploits" in data and len(data["exploits"]) > 0:
+            exploit_id = data["exploits"][0]["id"]
+            download_url = f"https://www.exploit-db.com/download/{exploit_id}.txt"
+            r = requests.get(download_url, timeout=10)
+            if r.status_code == 200:
+                temp_dir = tempfile.mkdtemp(prefix="exploitdb_")
+                file_path = os.path.join(temp_dir, f"{cve}_exploit.txt")
+                with open(file_path, "wb") as f:
+                    f.write(r.content)
+                return file_path
+    except Exception as e:
+        print(f"[!] Lỗi tải exploit-db cho {cve}: {e}")
+    return None
+
+def fetch_github_exploit(cve):
+    """
+    Tìm exploit trên Github bằng GitHub Search Code API.
+    Cần token nếu bị giới hạn, demo public request.
+    """
+    try:
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        search_url = f"https://api.github.com/search/code?q={cve}+in:file+language:python"
+        r = requests.get(search_url, headers=headers, timeout=10)
+        r.raise_for_status()
+        result = r.json()
+        if result["total_count"] > 0:
+            file_info = result["items"][0]
+            download_url = file_info["html_url"].replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+            temp_dir = tempfile.mkdtemp(prefix="github_")
+            file_name = download_url.split("/")[-1]
+            file_path = os.path.join(temp_dir, file_name)
+            raw_resp = requests.get(download_url, timeout=10)
+            if raw_resp.status_code == 200:
+                with open(file_path, "wb") as f:
+                    f.write(raw_resp.content)
+                return file_path
+    except Exception as e:
+        print(f"[!] Lỗi tải exploit github cho {cve}: {e}")
+    return None
+
+def run_exploit_from_file(file_path, target):
+    """
+    Chạy exploit script từ file đã tải về.
+    Hỗ trợ .sh, .py, .pl, .rb, .php.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".sh":
+        cmd = ["bash", file_path, target]
+    elif ext == ".py":
+        cmd = ["python3", file_path, target]
+    elif ext == ".pl":
+        cmd = ["perl", file_path, target]
+    elif ext == ".rb":
+        cmd = ["ruby", file_path, target]
+    elif ext == ".php":
+        cmd = ["php", file_path, target]
+    else:
+        return False, f"Unsupported exploit file type: {ext}"
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        success = proc.returncode == 0
+        output = proc.stdout + "\n" + proc.stderr
+        return success, output
+    except Exception as e:
+        return False, f"Error running exploit: {e}"
+
 def run_exploit(cve, target):
     """
-    Demo chạy exploit:
-    - Nếu CVE là CVE-2021-44228 thành công
-    - Các CVE khác thất bại
-    Bạn có thể thay phần này bằng code thật tải và chạy exploit trong Docker sandbox.
+    Tự động lấy exploit từ exploit-db, fallback github, rồi chạy.
     """
-    if cve == "CVE-2021-44228":
-        output = f"Exploit {cve} on {target} successful! Payload executed."
-        success = True
-    else:
-        output = f"Exploit {cve} on {target} failed. No vulnerability found."
-        success = False
+    file_path = fetch_exploitdb_exploit(cve)
+    source = "exploit-db"
+    if not file_path:
+        file_path = fetch_github_exploit(cve)
+        source = "github"
+    if not file_path:
+        return False, f"No exploit found for {cve} on exploit-db or github.", "none"
 
-    return success, output
+    success, output = run_exploit_from_file(file_path, target)
+    # Dọn dẹp thư mục tạm
+    try:
+        shutil.rmtree(os.path.dirname(file_path))
+    except Exception:
+        pass
+
+    return success, output, source
+
+# -------- HTML & Flask routes --------
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -397,7 +484,7 @@ table {
     border-collapse: collapse; width: 100%; background: rgba(0,0,0,0.7);
 }
 th, td { 
-    border: 1px solid #ddd; padding: 8px; color: #fff;
+    border: 1px solid #ddd; padding: 8px; color: #fff; vertical-align: top;
 }
 th { 
     background: #444;
@@ -409,6 +496,9 @@ button {
     padding: 10px 15px; font-size: 16px; margin-bottom: 20px;
     cursor: pointer;
 }
+pre {
+    white-space: pre-wrap; max-width: 300px; overflow-wrap: break-word;
+}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -419,7 +509,9 @@ button {
 <p id="status"></p>
 
 <table>
-<thead><tr><th>CVE</th><th>OS</th><th>Source</th><th>Target</th><th>Status</th></tr></thead>
+<thead>
+<tr><th>CVE</th><th>OS</th><th>Source</th><th>Target</th><th>Status</th><th>Output</th></tr>
+</thead>
 <tbody id="logTable">
 {% for e in log %}
 <tr>
@@ -428,6 +520,7 @@ button {
 <td>{{ e.source }}</td>
 <td>{{ e.target }}</td>
 <td>{{ e.status }}</td>
+<td><pre>{{ e.output }}</pre></td>
 </tr>
 {% endfor %}
 </tbody>
@@ -438,17 +531,16 @@ button {
 <script>
 function startScan(){
     document.getElementById('status').innerText = "Scanning...";
-    // Ví dụ scan nhiều CVE và nhiều target
     fetch("/start_scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-            cves: ["CVE-2021-44228", "CVE-2017-0144"],
+            cves: ["CVE-2021-44228", "CVE-2017-0144", "CVE-2019-0708"],
             targets: ["192.168.1.10", "192.168.1.20"]
         })
     }).then(res => res.json()).then(data => {
-        document.getElementById('status').innerText = "Scan started!";
-        setTimeout(() => location.reload(), 15000);
+        document.getElementById('status').innerText = "Scan finished! Reloading results...";
+        setTimeout(() => location.reload(), 3000);
     });
 }
 
@@ -456,15 +548,14 @@ const ctx = document.getElementById('resultChart').getContext('2d');
 const chart = new Chart(ctx, {
     type: 'pie',
     data: {
-        labels: ['Success', 'Fail', 'Unknown'],
+        labels: ['Success', 'Fail'],
         datasets: [{
             label: 'Exploit Results',
             data: [
                 {{ log|selectattr("status", "equalto", "success")|list|length }},
-                {{ log|selectattr("status", "equalto", "fail")|list|length }},
-                {{ log|length - (log|selectattr("status", "equalto", "success")|list|length + log|selectattr("status", "equalto", "fail")|list|length) }}
+                {{ log|selectattr("status", "equalto", "fail")|list|length }}
             ],
-            backgroundColor: ['#4caf50', '#f44336', '#9e9e9e']
+            backgroundColor: ['#4caf50', '#f44336']
         }]
     }
 });
@@ -485,28 +576,29 @@ def start_scan():
     cves = data.get("cves", [])
     targets = data.get("targets", [])
 
-    # Xóa log cũ để demo (hoặc bạn giữ lại tùy ý)
     global log_data
     log_data = []
 
-    # Giả lập quét từng CVE trên từng target, có OS và source
     for target in targets:
         for cve in cves:
-            status = "success" if cve == "CVE-2021-44228" else "fail"
+            success, output, source = run_exploit(cve, target)
             os_type = "Linux" if "2021" in cve else "Windows"
-            source = "exploit-db" if status=="success" else "github"
+            status = "success" if success else "fail"
             log_data.append({
                 "cve": cve,
                 "os": os_type,
                 "source": source,
                 "target": target,
-                "status": status
+                "status": status,
+                "output": output
             })
 
-    return jsonify({"status": "started", "entries": len(log_data)})
+    return jsonify({"status": "finished", "entries": len(log_data)})
 
 if __name__ == "__main__":
     start_banner_thread()
     print("\n[i] Starting Exploit Scanner Web UI on http://127.0.0.1:5000")
     app.run(debug=False)
 
+
+h
