@@ -1,7 +1,7 @@
 import os, sys, threading, requests, json, gzip, subprocess, smtplib, time, tempfile, shutil
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
-
+import nmap from nmap
 # ------------- Config -------------
 CONFIG = {
     "targets": ["192.168.1.10"],
@@ -339,227 +339,232 @@ def scan_cve_list(cve_list):
 
 app = Flask(__name__)
 
-log_data = []
-
+# ======================
+# Banner và màu đổi liên tục
+# ======================
 BANNER_TEXT = "YURI08loveELAINA"
+BANNER_COLORS = ["red", "green", "yellow", "blue", "magenta", "cyan"]
 
-COLORS = [
-    "\033[91m",  # đỏ
-    "\033[92m",  # xanh lá
-    "\033[93m",  # vàng
-    "\033[94m",  # xanh dương
-    "\033[95m",  # tím
-    "\033[96m",  # xanh nước biển nhạt
-]
+def get_colored_banner():
+    color = random.choice(BANNER_COLORS)
+    return f'<span style="color:{color}; font-weight:bold;">{BANNER_TEXT}</span>'
 
-RESET = "\033[0m"
+# ======================
+# ML simple phân tích output exploit
+# ======================
+def ml_predict_success(exploit_output: str) -> bool:
+    keywords_success = ["success", "exploit done", "shell spawned", "access granted"]
+    keywords_fail = ["error", "fail", "denied", "not vulnerable"]
+    output_lower = exploit_output.lower()
+    score = sum(k in output_lower for k in keywords_success) - sum(k in output_lower for k in keywords_fail)
+    return score > 0
 
-def print_color_banner():
-    while True:
-        for color in COLORS:
-            sys.stdout.write("\r" + color + BANNER_TEXT + RESET)
-            sys.stdout.flush()
-            time.sleep(0.5)
+# ======================
+# Tích hợp Nmap scan lấy CVE từ script vuln
+# ======================
+def nmap_scan(target_ip):
+    nm = nmap.PortScanner()
+    nm.scan(target_ip, arguments='-sV --script vuln')
+    cves_found = []
+    for host in nm.all_hosts():
+        for proto in nm[host].all_protocols():
+            for port in nm[host][proto]:
+                scripts = nm[host][proto][port].get('script', {})
+                for output in scripts.values():
+                    cves_found.extend(re.findall(r'CVE-\d{4}-\d{4,7}', output))
+    return list(set(cves_found))
 
-def start_banner_thread():
-    t = threading.Thread(target=print_color_banner, daemon=True)
-    t.start()
-
-# -------- Exploit fetching & running --------
-
-def fetch_exploitdb_exploit(cve):
-    """
-    Tìm và tải exploit code từ Exploit-DB theo CVE.
-    Do Exploit-DB không có API chính thức, nên phần này dùng API giả lập,
-    bạn có thể thay bằng scraping hoặc API thật nếu có.
-    """
-    # Demo API giả lập:
-    api_url = f"https://www.exploit-db.com/api/search?cve={cve}"
-    try:
-        resp = requests.get(api_url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if data and "exploits" in data and len(data["exploits"]) > 0:
-            exploit_id = data["exploits"][0]["id"]
-            download_url = f"https://www.exploit-db.com/download/{exploit_id}.txt"
-            r = requests.get(download_url, timeout=10)
-            if r.status_code == 200:
-                temp_dir = tempfile.mkdtemp(prefix="exploitdb_")
-                file_path = os.path.join(temp_dir, f"{cve}_exploit.txt")
-                with open(file_path, "wb") as f:
-                    f.write(r.content)
-                return file_path
-    except Exception as e:
-        print(f"[!] Lỗi tải exploit-db cho {cve}: {e}")
-    return None
-
-def fetch_github_exploit(cve):
-    """
-    Tìm exploit trên Github bằng GitHub Search Code API.
-    Cần token nếu bị giới hạn, demo public request.
-    """
-    try:
-        headers = {"Accept": "application/vnd.github.v3+json"}
-        search_url = f"https://api.github.com/search/code?q={cve}+in:file+language:python"
-        r = requests.get(search_url, headers=headers, timeout=10)
-        r.raise_for_status()
-        result = r.json()
-        if result["total_count"] > 0:
-            file_info = result["items"][0]
-            download_url = file_info["html_url"].replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-            temp_dir = tempfile.mkdtemp(prefix="github_")
-            file_name = download_url.split("/")[-1]
-            file_path = os.path.join(temp_dir, file_name)
-            raw_resp = requests.get(download_url, timeout=10)
-            if raw_resp.status_code == 200:
-                with open(file_path, "wb") as f:
-                    f.write(raw_resp.content)
-                return file_path
-    except Exception as e:
-        print(f"[!] Lỗi tải exploit github cho {cve}: {e}")
-    return None
-
-def run_exploit_from_file(file_path, target):
-    """
-    Chạy exploit script từ file đã tải về.
-    Hỗ trợ .sh, .py, .pl, .rb, .php.
-    """
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".sh":
-        cmd = ["bash", file_path, target]
-    elif ext == ".py":
-        cmd = ["python3", file_path, target]
-    elif ext == ".pl":
-        cmd = ["perl", file_path, target]
-    elif ext == ".rb":
-        cmd = ["ruby", file_path, target]
-    elif ext == ".php":
-        cmd = ["php", file_path, target]
+# ======================
+# Lấy exploit từ Exploit-DB (demo giả lập)
+# Nếu không có, fallback tìm từ GitHub (demo giả lập)
+# ======================
+def fetch_exploit_code(cve_id):
+    # Giả lập: nếu CVE có số chẵn thì có exploit-db, số lẻ thì phải lấy github
+    if int(cve_id.split('-')[-1]) % 2 == 0:
+        return f"# Exploit code from Exploit-DB for {cve_id}\necho 'Exploit {cve_id} running...'\nexit 0"
     else:
-        return False, f"Unsupported exploit file type: {ext}"
+        return f"# Exploit code fallback from GitHub for {cve_id}\necho 'GitHub Exploit {cve_id} running...'\nexit 0"
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        success = proc.returncode == 0
-        output = proc.stdout + "\n" + proc.stderr
-        return success, output
-    except Exception as e:
-        return False, f"Error running exploit: {e}"
+# ======================
+# Chạy exploit trong sandbox Docker (demo giả lập, bạn cần có Docker setup thực tế)
+# ======================
+def run_exploit_in_docker(exploit_code, target):
+    # Lưu exploit tạm thời
+    filename = f"/tmp/exploit_{random.randint(1000,9999)}.sh"
+    with open(filename, "w") as f:
+        f.write(exploit_code)
+    os.chmod(filename, 0o755)
 
-def run_exploit(cve, target):
-    """
-    Tự động lấy exploit từ exploit-db, fallback github, rồi chạy.
-    """
-    file_path = fetch_exploitdb_exploit(cve)
-    source = "exploit-db"
-    if not file_path:
-        file_path = fetch_github_exploit(cve)
-        source = "github"
-    if not file_path:
-        return False, f"No exploit found for {cve} on exploit-db or github.", "none"
+    # Giả lập chạy exploit trên target, thật ra bạn chạy docker container và mount file này vào
+    proc = subprocess.run([filename, target], capture_output=True, text=True, timeout=20)
+    output = proc.stdout + proc.stderr
+    success = ml_predict_success(output)
+    os.remove(filename)
+    return success, output
 
-    success, output = run_exploit_from_file(file_path, target)
-    # Dọn dẹp thư mục tạm
-    try:
-        shutil.rmtree(os.path.dirname(file_path))
-    except Exception:
-        pass
+# ======================
+# Scan & Exploit multi-threaded
+# ======================
+def scan_and_exploit(cves, targets):
+    results = []
+    for target in targets:
+        # Tự động lấy CVE nếu input target mà cves trống (từ nmap)
+        if not cves:
+            cves = nmap_scan(target)
+        for cve in cves:
+            exploit_code = fetch_exploit_code(cve)
+            success, output = run_exploit_in_docker(exploit_code, target)
+            results.append({
+                "target": target,
+                "cve": cve,
+                "success": success,
+                "output": output,
+                "timestamp": datetime.now().isoformat()
+            })
+            # Gửi alert nếu thành công (demo chỉ print)
+            if success:
+                print(f"[ALERT] Exploit succeeded on {target} - {cve}")
+    return results
 
-    return success, output, source
+# ======================
+# API RESTful mở rộng
+# ======================
+@app.route('/api/v1/scan', methods=['POST'])
+def api_scan():
+    data = request.json
+    cves = data.get("cves", [])
+    targets = data.get("targets", [])
+    if not targets:
+        return jsonify({"error": "No targets specified"}), 400
+    results = scan_and_exploit(cves, targets)
+    # Lưu log kết quả
+    with open("scan_log.json", "w") as f:
+        json.dump(results, f, indent=2)
+    return jsonify({"results": results})
 
-# -------- HTML & Flask routes --------
+@app.route('/api/v1/alerts', methods=['POST'])
+def api_alert():
+    alert = request.json
+    print("Received alert:", alert)
+    return jsonify({"status": "ok"})
 
+# ======================
+# Web UI + Dashboard + Banner + Background + Footer
+# ======================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>Exploit Scan Dashboard</title>
+<meta charset="UTF-8" />
+<title>YURI08 CVE Scanner & Exploiter</title>
 <style>
-body { 
-    font-family: Arial; margin: 20px; 
-    background: url('https://i.imgur.com/v3jRrPq.jpg') no-repeat center center fixed;
-    background-size: cover; color: #fff;
-}
-table { 
-    border-collapse: collapse; width: 100%; background: rgba(0,0,0,0.7);
-}
-th, td { 
-    border: 1px solid #ddd; padding: 8px; color: #fff; vertical-align: top;
-}
-th { 
-    background: #444;
-}
-footer {
-    margin-top: 20px; font-size: 14px; text-align: center; color: #ccc;
-}
-button {
-    padding: 10px 15px; font-size: 16px; margin-bottom: 20px;
+  body {
+    background: url('https://i.imgur.com/wlHjQyD.jpg') no-repeat center center fixed;
+    background-size: cover;
+    color: white;
+    font-family: Arial, sans-serif;
+    margin: 0; padding: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 1rem;
+    font-size: 2rem;
+    font-weight: bold;
+    text-align: center;
+  }
+  #banner { font-weight: bold; }
+  main {
+    flex-grow: 1;
+    padding: 1rem;
+    background-color: rgba(0,0,0,0.5);
+  }
+  footer {
+    text-align: center;
+    padding: 0.5rem;
+    background-color: rgba(0,0,0,0.7);
+    font-size: 0.9rem;
+  }
+  button {
+    background: #4CAF50;
+    border: none;
+    padding: 0.6rem 1.2rem;
+    color: white;
     cursor: pointer;
-}
-pre {
-    white-space: pre-wrap; max-width: 300px; overflow-wrap: break-word;
-}
+    font-size: 1rem;
+    margin-top: 1rem;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1rem;
+  }
+  th, td {
+    border: 1px solid white;
+    padding: 0.5rem;
+    text-align: left;
+  }
+  th {
+    background: rgba(255,255,255,0.2);
+  }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+async function startScan() {
+  const cvesInput = document.getElementById('cves').value;
+  const targetsInput = document.getElementById('targets').value;
+  const cves = cvesInput.split(',').map(s => s.trim()).filter(Boolean);
+  const targets = targetsInput.split(',').map(s => s.trim()).filter(Boolean);
+  if(targets.length === 0) {
+    alert("Please input at least one target IP/domain.");
+    return;
+  }
+  document.getElementById('results').innerHTML = 'Scanning... Please wait.';
+  const resp = await fetch('/api/v1/scan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({cves, targets})
+  });
+  const data = await resp.json();
+  if(data.error) {
+    document.getElementById('results').innerText = data.error;
+    return;
+  }
+  let html = '<table><tr><th>Target</th><th>CVE</th><th>Success</th><th>Output</th><th>Timestamp</th></tr>';
+  data.results.forEach(r => {
+    html += `<tr>
+      <td>${r.target}</td>
+      <td>${r.cve}</td>
+      <td style="color:${r.success ? 'lightgreen':'red'}">${r.success}</td>
+      <td><pre style="white-space: pre-wrap; max-height:100px; overflow:auto;">${r.output}</pre></td>
+      <td>${r.timestamp}</td>
+    </tr>`;
+  });
+  html += '</table>';
+  document.getElementById('results').innerHTML = html;
+}
+
+// Đổi màu banner liên tục
+function changeBannerColor() {
+  const colors = ["red","green","yellow","blue","magenta","cyan"];
+  const banner = document.getElementById('banner');
+  const color = colors[Math.floor(Math.random() * colors.length)];
+  banner.style.color = color;
+}
+setInterval(changeBannerColor, 700);
+</script>
 </head>
 <body>
-<h1>Exploit Scan Dashboard</h1>
-
-<button onclick="startScan()">Start Sample Scan</button>
-<p id="status"></p>
-
-<table>
-<thead>
-<tr><th>CVE</th><th>OS</th><th>Source</th><th>Target</th><th>Status</th><th>Output</th></tr>
-</thead>
-<tbody id="logTable">
-{% for e in log %}
-<tr>
-<td>{{ e.cve }}</td>
-<td>{{ e.os }}</td>
-<td>{{ e.source }}</td>
-<td>{{ e.target }}</td>
-<td>{{ e.status }}</td>
-<td><pre>{{ e.output }}</pre></td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-
-<canvas id="resultChart" width="400" height="200"></canvas>
-
-<script>
-function startScan(){
-    document.getElementById('status').innerText = "Scanning...";
-    fetch("/start_scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            cves: ["CVE-2021-44228", "CVE-2017-0144", "CVE-2019-0708"],
-            targets: ["192.168.1.10", "192.168.1.20"]
-        })
-    }).then(res => res.json()).then(data => {
-        document.getElementById('status').innerText = "Scan finished! Reloading results...";
-        setTimeout(() => location.reload(), 3000);
-    });
-}
-
-const ctx = document.getElementById('resultChart').getContext('2d');
-const chart = new Chart(ctx, {
-    type: 'pie',
-    data: {
-        labels: ['Success', 'Fail'],
-        datasets: [{
-            label: 'Exploit Results',
-            data: [
-                {{ log|selectattr("status", "equalto", "success")|list|length }},
-                {{ log|selectattr("status", "equalto", "fail")|list|length }}
-            ],
-            backgroundColor: ['#4caf50', '#f44336']
-        }]
-    }
-});
-</script>
+<header><div id="banner">{{ banner|safe }}</div></header>
+<main>
+  <h2>Scan & Exploit CVE</h2>
+  <label for="cves">CVE IDs (comma separated, empty = auto from target):</label><br>
+  <input type="text" id="cves" style="width: 100%;" placeholder="e.g. CVE-2021-44228,CVE-2019-0708" /><br><br>
+  <label for="targets">Target IPs/Domains (comma separated):</label><br>
+  <input type="text" id="targets" style="width: 100%;" placeholder="e.g. 192.168.1.5,example.com" /><br>
+  <button onclick="startScan()">Start Scan & Exploit</button>
+  <div id="results" style="margin-top:1rem;"></div>
+</main>
 <footer>coding by YURI08</footer>
 </body>
 </html>
@@ -567,38 +572,14 @@ const chart = new Chart(ctx, {
 
 @app.route('/')
 def index():
-    global log_data
-    return render_template_string(HTML_TEMPLATE, log=log_data)
+    return render_template_string(HTML_TEMPLATE, banner=get_colored_banner())
 
-@app.route('/start_scan', methods=['POST'])
-def start_scan():
-    data = request.json
-    cves = data.get("cves", [])
-    targets = data.get("targets", [])
-
-    global log_data
-    log_data = []
-
-    for target in targets:
-        for cve in cves:
-            success, output, source = run_exploit(cve, target)
-            os_type = "Linux" if "2021" in cve else "Windows"
-            status = "success" if success else "fail"
-            log_data.append({
-                "cve": cve,
-                "os": os_type,
-                "source": source,
-                "target": target,
-                "status": status,
-                "output": output
-            })
-
-    return jsonify({"status": "finished", "entries": len(log_data)})
-
-if __name__ == "__main__":
-    start_banner_thread()
-    print("\n[i] Starting Exploit Scanner Web UI on http://127.0.0.1:5000")
-    app.run(debug=False)
+# ======================
+# Main chạy Flask
+# ======================
+if __name__ == '__main__':
+    print(get_colored_banner())
+    app.run(host='0.0.0.0', port=5000)
 
 
 h
