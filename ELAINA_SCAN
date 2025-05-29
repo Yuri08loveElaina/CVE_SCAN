@@ -366,6 +366,22 @@ def start_banner_thread():
     t = threading.Thread(target=print_color_banner, daemon=True)
     t.start()
 
+def run_exploit(cve, target):
+    """
+    Demo chạy exploit:
+    - Nếu CVE là CVE-2021-44228 thành công
+    - Các CVE khác thất bại
+    Bạn có thể thay phần này bằng code thật tải và chạy exploit trong Docker sandbox.
+    """
+    if cve == "CVE-2021-44228":
+        output = f"Exploit {cve} on {target} successful! Payload executed."
+        success = True
+    else:
+        output = f"Exploit {cve} on {target} failed. No vulnerability found."
+        success = False
+
+    return success, output
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
